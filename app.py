@@ -23,7 +23,7 @@ import websocket
 
 
 APP_NAME = "领星数字SKU清理助手"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 LIST_URL = "https://oms.xlwms.com/platform/order/list"
 LOGIN_URL_PART = "/login"
 DEBUG_PORT = 19225
@@ -413,6 +413,7 @@ class LingxingAutomation:
             total,
             tabTotal,
             pageSize,
+            allOrderIds:rowIds,
             candidates
           };
         })()"""
@@ -435,6 +436,7 @@ class LingxingAutomation:
                     "scanned": last_state.get("scanned"),
                     "total": last_state.get("total"),
                     "tabTotal": last_state.get("tabTotal"),
+                    "allOrderIds": last_state.get("allOrderIds", []),
                     "candidates": last_state.get("candidates", []),
                 },
                 ensure_ascii=False,
@@ -519,6 +521,37 @@ class LingxingAutomation:
         if not isinstance(state, dict) or not state.get("ready"):
             raise RuntimeError("无法识别产品信息表，页面结构可能已更新。")
         return state
+
+    def _wait_edit_form_stable(self, timeout: float = 20, stable_seconds: float = 1.5) -> None:
+        """Wait for Lingxing to hydrate untouched order fields before any mutation."""
+        assert self.page
+        deadline = time.time() + timeout
+        previous = ""
+        stable_since: float | None = None
+        while time.time() < deadline:
+            state = self._read_edit_state()
+            country_ready = bool(
+                self.page.evaluate(
+                    """(() => {
+                      const items=[...document.querySelectorAll('.el-form-item')];
+                      const item=items.find(e=>(e.querySelector('.el-form-item__label')?.innerText||'')
+                        .includes('国家/地区'));
+                      const input=item?.querySelector('input');
+                      return !!item && !!(input?.value||'').trim() &&
+                        item.classList.contains('is-success') && !item.classList.contains('is-error');
+                    })()"""
+                )
+            )
+            signature = json.dumps(state["outsideInputs"], ensure_ascii=False, sort_keys=True)
+            if country_ready and signature == previous:
+                stable_since = stable_since or time.time()
+                if time.time() - stable_since >= stable_seconds:
+                    return
+            else:
+                stable_since = None
+            previous = signature
+            time.sleep(0.3)
+        raise RuntimeError("订单原始表单在20秒内未完成加载，已停止且未修改。")
 
     def _remove_row(self, row_id: str) -> None:
         assert self.page
@@ -609,20 +642,92 @@ class LingxingAutomation:
         assert self.page
         clicked = self.page.evaluate(
             """(() => {
+              const visible=(e)=>{
+                const style=getComputedStyle(e), rect=e.getBoundingClientRect();
+                return style.display!=='none' && style.visibility!=='hidden' && rect.width>0 && rect.height>0;
+              };
               const buttons=[...document.querySelectorAll('button')]
-                .filter(b=>b.offsetParent!==null && (b.innerText||'').trim()==='保存');
+                .filter(b=>visible(b) && (b.innerText||'').trim()==='保存');
               if(buttons.length!==1) return false;
               buttons[0].click(); return true;
             })()"""
         )
         if not clicked:
             raise RuntimeError("“保存”按钮不是唯一精确匹配，已停止以避免误操作。")
-        self._wait(lambda: "/platform/order/list" in self.page.url(), 25, "保存后返回订单列表")
+
+        # Saving does not consistently navigate back to the list. Wait for the
+        # request/UI to settle, capture explicit failures, then verify from a
+        # freshly loaded list instead of clicking Save again.
+        started = time.time()
+        deadline = started + 10
+        saw_loading = False
+        while time.time() < deadline:
+            if "/platform/order/list" in self.page.url():
+                return
+            status = self.page.evaluate(
+                """(() => {
+                  const visible=(e)=>{
+                    const style=getComputedStyle(e), rect=e.getBoundingClientRect();
+                    return style.display!=='none' && style.visibility!=='hidden' &&
+                      Number(style.opacity||1)>0 && rect.width>0 && rect.height>0;
+                  };
+                  const save=[...document.querySelectorAll('button')]
+                    .find(b=>visible(b) && (b.innerText||'').trim()==='保存');
+                  const messages=[...document.querySelectorAll('.el-message,.el-notification')]
+                    .filter(visible).map(e=>(e.innerText||'').trim()).filter(Boolean);
+                  const country=[...document.querySelectorAll('.el-form-item')]
+                    .find(e=>(e.querySelector('.el-form-item__label')?.innerText||'').includes('国家/地区'));
+                  const countryEmpty=!!country && country.classList.contains('is-error') &&
+                    !(country.querySelector('input')?.value||'').trim();
+                  return {loading:!!save && (save.classList.contains('is-loading')||save.disabled),
+                    messages,countryEmpty};
+                })()"""
+            ) or {}
+            messages = [str(item) for item in status.get("messages", [])]
+            failure = next(
+                (text for text in messages if any(word in text for word in ["异常", "失败", "不能为空", "错误"])),
+                "",
+            )
+            if status.get("countryEmpty"):
+                raise RuntimeError("保存被领星校验拦截：国家/地区尚未完成加载。")
+            if failure:
+                raise RuntimeError(f"领星保存失败：{failure}")
+            loading = bool(status.get("loading"))
+            saw_loading = saw_loading or loading
+            if saw_loading and not loading:
+                break
+            if not loading and time.time() - started >= 5:
+                break
+            time.sleep(0.25)
+        if "/platform/order/list" not in self.page.url():
+            self.page.navigate(LIST_URL)
+            self._wait(lambda: "/platform/order/list" in self.page.url(), 15, "保存后打开订单列表")
+
+    def _verify_saved_from_list(self, system_order_id: str, expected_remaining: list[dict[str, Any]]) -> None:
+        self.open_pending_list(refresh=True)
+        state = self._read_stable_list_state()
+        all_order_ids = set(state.get("allOrderIds", []))
+        if system_order_id not in all_order_ids:
+            raise RuntimeError("保存后复核失败：订单不在待处理列表，已停止且不会重试保存。")
+        candidate_ids = {item.get("systemOrderId") for item in state.get("candidates", [])}
+        if len(expected_remaining) == 1:
+            if system_order_id in candidate_ids:
+                raise RuntimeError("保存后复核失败：订单仍显示“多个”，目标SKU可能未保存。")
+            return
+
+        self._click_edit(system_order_id)
+        verified = self._read_edit_state()
+        if self._product_signature(verified["rows"]) != self._product_signature(expected_remaining):
+            self.open_pending_list(refresh=True)
+            raise RuntimeError("保存后详情复核不一致，已停止且不会重试保存。")
+        self.open_pending_list(refresh=True)
 
     def process_order(self, candidate: dict[str, Any], scan_only: bool) -> OrderResult:
         system_id = candidate["systemOrderId"]
         platform_id = candidate.get("platformOrderId", "")
         self._click_edit(system_id)
+        if not scan_only:
+            self._wait_edit_form_stable()
         initial = self._read_edit_state()
         rows = initial["rows"]
         targets = choose_removal_targets(rows)
@@ -647,12 +752,13 @@ class LingxingAutomation:
         if not after["rows"]:
             raise RuntimeError("安全护栏阻止保存空产品订单。")
         self._click_save()
+        self._verify_saved_from_list(system_id, expected_remaining)
         return OrderResult(
             system_id,
             platform_id,
             "saved",
             removed_skus=[row["platformSku"] for row in targets],
-            detail="已保存并返回订单列表",
+            detail="已保存并通过列表复核",
         )
 
     def run(self, scan_only: bool = False) -> RunReport:
@@ -690,6 +796,8 @@ class LingxingAutomation:
             try:
                 result = self.process_order(candidate, scan_only)
             except Exception as exc:
+                if self.stop_requested:
+                    raise RuntimeError("用户已停止运行。") from exc
                 result = OrderResult(
                     system_id,
                     candidate.get("platformOrderId", ""),
