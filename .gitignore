@@ -1,0 +1,8 @@
+.builddeps/
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
+.pytest_cache/
+
