@@ -4,14 +4,13 @@ import json
 import os
 import queue
 import shutil
-import socket
 import subprocess
 import sys
 import threading
 import time
 import traceback
-import urllib.error
 import urllib.request
+import ctypes
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -24,11 +23,12 @@ import websocket
 
 
 APP_NAME = "领星数字SKU清理助手"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 LIST_URL = "https://oms.xlwms.com/platform/order/list"
 LOGIN_URL_PART = "/login"
 DEBUG_PORT = 19225
 MAX_CANDIDATES = 200
+_INSTANCE_MUTEX: int | None = None
 
 
 def app_data_dir() -> Path:
@@ -66,6 +66,19 @@ def choose_removal_targets(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if len(matches) > allowed:
         matches = matches[-allowed:] if allowed else []
     return list(reversed(matches))
+
+
+def acquire_single_instance() -> bool:
+    """Prevent two automation windows from operating the same Chrome session."""
+    global _INSTANCE_MUTEX
+    if os.name != "nt":
+        return True
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    handle = kernel32.CreateMutexW(None, False, "Local\\LingxingNumericSkuCleaner_v1")
+    if not handle:
+        return False
+    _INSTANCE_MUTEX = int(handle)
+    return kernel32.GetLastError() != 183
 
 
 @dataclass
@@ -277,38 +290,81 @@ class LingxingAutomation:
         )
         if not clicked:
             raise RuntimeError("未找到“待处理”页签，页面结构可能已更新。")
-        self._wait(lambda: "待处理" in self.page.body_text(), 15, "待处理订单")
-        self._set_page_size_100()
+        self._wait(
+            lambda: bool(
+                self.page.evaluate(
+                    """(() => [...document.querySelectorAll('[role=tab],.el-tabs__item')]
+                      .some(e => /^待处理(?:\\s|\\()/.test((e.innerText||'').trim()) &&
+                        (e.getAttribute('aria-selected')==='true' || e.classList.contains('is-active'))))()"""
+                )
+            ),
+            15,
+            "待处理页签切换",
+        )
+        time.sleep(0.5)
+        self._wait(
+            lambda: bool(
+                self.page.evaluate(
+                    """(() => !!document.querySelector('.el-pagination__total'))()"""
+                )
+            ),
+            25,
+            "待处理订单数据",
+        )
+        self._set_page_size_for_all()
         self._wait(lambda: bool(self._read_list_state().get("ready")), 25, "订单表格")
 
-    def _set_page_size_100(self) -> None:
+    def _pagination_state(self) -> dict[str, int]:
         assert self.page
-        if "100条/页" in self.page.body_text():
+        result = self.page.evaluate(
+            """(() => {
+              const digits=(text)=>Number(((text||'').match(/\\d+/)||['0'])[0]);
+              const total=digits(document.querySelector('.el-pagination__total')?.innerText);
+              const pageSize=digits(document.querySelector('.el-pagination__sizes input')?.value);
+              return {total,pageSize};
+            })()"""
+        )
+        if not isinstance(result, dict):
+            return {"total": 0, "pageSize": 0}
+        return {"total": int(result.get("total", 0)), "pageSize": int(result.get("pageSize", 0))}
+
+    def _set_page_size_for_all(self) -> None:
+        """Fit all pending orders on one page so a single candidate queue is complete."""
+        assert self.page
+        pagination = self._pagination_state()
+        total = pagination["total"]
+        current_size = pagination["pageSize"]
+        available_sizes = [100, 200, 500, 1000, 2000]
+        target_size = next((size for size in available_sizes if size >= total), None)
+        if target_size is None:
+            raise RuntimeError("待处理订单超过 2000 笔，超出单页安全扫描上限，已停止。")
+        if current_size >= total and current_size >= 100:
             return
         opened = self.page.evaluate(
             """(() => {
-              const inputs=[...document.querySelectorAll('input')];
-              const input=inputs.find(i => /条\\/页/.test(i.value||i.placeholder||''));
+              const input=document.querySelector('.el-pagination__sizes input');
               if(!input) return false;
-              (input.closest('.el-select')||input).click();
+              input.click();
               return true;
             })()"""
         )
         if not opened:
-            self.log("未找到分页数量选择器，将按当前页面数量继续。")
-            return
+            raise RuntimeError("未找到分页数量选择器，无法保证完整扫描。")
         time.sleep(0.5)
         selected = self.page.evaluate(
-            """(() => {
+            f"""(() => {{
+              const target={target_size};
               const options=[...document.querySelectorAll('.el-select-dropdown__item')]
                 .filter(e => e.offsetParent!==null);
-              const option=options.find(e => (e.innerText||'').trim()==='100条/页');
+              const option=options.find(e => Number((((e.innerText||'').match(/\\d+/)||['0'])[0]))===target);
               if(!option) return false;
               option.click(); return true;
-            })()"""
+            }})()"""
         )
-        if selected:
-            time.sleep(1)
+        if not selected:
+            raise RuntimeError(f"分页器中没有 {target_size} 条/页选项，无法保证完整扫描。")
+        self._wait(lambda: self._pagination_state()["pageSize"] == target_size, 10, "分页数量更新")
+        time.sleep(0.5)
 
     def _read_list_state(self) -> dict[str, Any]:
         assert self.page
@@ -318,42 +374,106 @@ class LingxingAutomation:
           const col=(name)=>headers.find(h=>h.text===name)?.colid;
           const platformCol=col('平台单号');
           const skuCol=col('平台SKU*数量');
-          if(!platformCol||!skuCol) return {ready:false, scanned:0, candidates:[]};
+          const digits=(text)=>Number(((text||'').match(/\\d+/)||['0'])[0]);
+          const total=digits(document.querySelector('.el-pagination__total')?.innerText);
+          const pageSize=digits(document.querySelector('.el-pagination__sizes input')?.value);
+          const pendingTab=[...document.querySelectorAll('[role=tab],.el-tabs__item')]
+            .find(e=>/^待处理(?:\\s|\\()/.test((e.innerText||'').trim()));
+          const tabMatch=(pendingTab?.innerText||'').match(/\\((\\d+)\\)/);
+          const tabTotal=tabMatch ? Number(tabMatch[1]) : null;
+          if(!platformCol||!skuCol||!pageSize||tabTotal===null)
+            return {ready:false, scanned:0, total, tabTotal, pageSize, candidates:[]};
           const rows=[...document.querySelectorAll('table.vxe-table--body tr[rowid]')];
           const rowIds=[...new Set(rows.map(r=>r.getAttribute('rowid')).filter(Boolean))];
           const candidates=[];
+          let hydrated=true;
           for(const rowid of rowIds){
             const main=rows.find(r=>r.getAttribute('rowid')===rowid && r.querySelector(`td[colid="${skuCol}"]`));
-            if(!main) continue;
+            if(!main){ hydrated=false; continue; }
             const skuText=(main.querySelector(`td[colid="${skuCol}"]`)?.innerText||'').trim();
-            if(!skuText.includes('多个')) continue;
             const platformId=(main.querySelector(`td[colid="${platformCol}"]`)?.innerText||'').trim().split(/\\s+/)[0];
+            if(!skuText || !platformId){ hydrated=false; continue; }
+            if(!skuText.includes('多个')) continue;
             candidates.push({systemOrderId:rowid, platformOrderId:platformId, platformSkuText:skuText});
           }
-          return {ready:true, scanned:rowIds.length, candidates};
+          const expected=Math.min(total,pageSize);
+          return {
+            ready:total===tabTotal && rowIds.length===expected && hydrated,
+            scanned:rowIds.length,
+            total,
+            tabTotal,
+            pageSize,
+            candidates
+          };
         })()"""
         result = self.page.evaluate(script)
         return result if isinstance(result, dict) else {"ready": False, "scanned": 0, "candidates": []}
 
+    def _read_stable_list_state(self, timeout: float = 30, stable_seconds: float = 2.5) -> dict[str, Any]:
+        """Wait until counts and hydrated SKU cells remain unchanged for a short window."""
+        deadline = time.time() + timeout
+        stable_since: float | None = None
+        previous_signature: str | None = None
+        last_state: dict[str, Any] = {"ready": False, "scanned": 0, "candidates": []}
+        while time.time() < deadline:
+            if self.stop_requested:
+                raise RuntimeError("用户已停止运行。")
+            last_state = self._read_list_state()
+            signature = json.dumps(
+                {
+                    "ready": last_state.get("ready"),
+                    "scanned": last_state.get("scanned"),
+                    "total": last_state.get("total"),
+                    "tabTotal": last_state.get("tabTotal"),
+                    "candidates": last_state.get("candidates", []),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            if last_state.get("ready") and signature == previous_signature:
+                stable_since = stable_since or time.time()
+                if time.time() - stable_since >= stable_seconds:
+                    return last_state
+            else:
+                stable_since = None
+            previous_signature = signature
+            time.sleep(0.5)
+        raise RuntimeError(f"订单列表在 {timeout:.0f} 秒内未达到稳定状态。")
+
     def _click_edit(self, system_order_id: str) -> None:
         assert self.page
-        clicked = self.page.evaluate(
-            f"""(() => {{
-              const safe={json.dumps(system_order_id)};
-              const rows=[...document.querySelectorAll('table.vxe-table--body tr[rowid]')]
-                .filter(r=>r.getAttribute('rowid')===safe);
-              const row=rows.find(r=>[...r.querySelectorAll('button')]
-                .some(b=>(b.innerText||'').trim()==='编辑'));
-              const button=row && [...row.querySelectorAll('button')]
-                .find(b=>(b.innerText||'').trim()==='编辑');
-              if(!button) return false;
-              button.click(); return true;
-            }})()"""
-        )
-        if not clicked:
-            raise RuntimeError("找不到该订单的“编辑”按钮。")
+        def click_when_ready() -> bool:
+            return bool(
+                self.page.evaluate(
+                    f"""(() => {{
+                      const safe={json.dumps(system_order_id)};
+                      const rows=[...document.querySelectorAll('table.vxe-table--body tr[rowid]')]
+                        .filter(r=>r.getAttribute('rowid')===safe);
+                      const row=rows.find(r=>[...r.querySelectorAll('button')]
+                        .some(b=>(b.innerText||'').trim()==='编辑'));
+                      const button=row && [...row.querySelectorAll('button')]
+                        .find(b=>(b.innerText||'').trim()==='编辑');
+                      if(!button) return false;
+                      button.click(); return true;
+                    }})()"""
+                )
+            )
+
+        self._wait(click_when_ready, 10, "该订单的编辑按钮")
         self._wait(lambda: f"/platform/order/edit/{system_order_id}" in self.page.url(), 20, "订单编辑页")
         self._wait(lambda: "产品信息" in self.page.body_text(), 20, "产品信息")
+        self._wait(
+            lambda: bool(
+                self.page.evaluate(
+                    """(() => {
+                      const rows=[...document.querySelectorAll('table.vxe-table--body tbody tr[rowid]')];
+                      return rows.length>0;
+                    })()"""
+                )
+            ),
+            20,
+            "订单产品行加载",
+        )
 
     def _read_edit_state(self) -> dict[str, Any]:
         assert self.page
@@ -496,7 +616,7 @@ class LingxingAutomation:
         self.start_browser()
         self.ensure_logged_in()
         self.open_pending_list(refresh=True)
-        state = self._read_list_state()
+        state = self._read_stable_list_state()
         report.scanned_orders = int(state.get("scanned", 0))
         candidates = state.get("candidates", [])
         unique: dict[tuple[str, str], dict[str, Any]] = {}
@@ -552,7 +672,7 @@ class LingxingAutomation:
 
         self.log("正在刷新待处理列表并执行最终复核……")
         self.open_pending_list(refresh=True)
-        final_state = self._read_list_state()
+        final_state = self._read_stable_list_state()
         report.remaining_multiple = len(final_state.get("candidates", []))
         report.finished_at = datetime.now().isoformat(timespec="seconds")
         self._save_report(report)
@@ -568,7 +688,7 @@ class LingxingAutomation:
 
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, scan_only_default: bool = False):
         super().__init__()
         self.title(f"{APP_NAME}  v{APP_VERSION}")
         self.geometry("780x590")
@@ -577,7 +697,7 @@ class App(tk.Tk):
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.automation: LingxingAutomation | None = None
         self.worker: threading.Thread | None = None
-        self.scan_only = tk.BooleanVar(value=False)
+        self.scan_only = tk.BooleanVar(value=scan_only_default)
         self.auto_started = False
         self._build_ui()
         self.after(100, self._drain_events)
@@ -696,7 +816,8 @@ class App(tk.Tk):
         if report.mode == "scan-only":
             summary = (
                 f"预检完成：扫描 {report.scanned_orders} 笔，候选 {report.candidate_orders} 笔，"
-                f"命中 {sum(len(r.removed_skus) for r in report.results)} 行；未修改任何订单。"
+                f"命中 {sum(len(r.removed_skus) for r in report.results)} 行，异常 {report.error_orders} 笔，"
+                f"复核仍显示“多个” {report.remaining_multiple} 笔；未修改任何订单。"
             )
         else:
             summary = (
@@ -739,4 +860,17 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    App().mainloop()
+    if not acquire_single_instance():
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showwarning(APP_NAME, "程序已经在运行，请勿重复启动。")
+        root.destroy()
+        raise SystemExit(2)
+    if "--self-test" in sys.argv[1:]:
+        automation = LingxingAutomation(lambda _text: None, lambda _done, _total: None)
+        automation.start_browser()
+        if not automation.page or "oms.xlwms.com" not in automation.page.url():
+            raise SystemExit(3)
+        automation.page.close()
+        raise SystemExit(0)
+    App(scan_only_default="--scan-only" in sys.argv[1:]).mainloop()
