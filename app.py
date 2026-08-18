@@ -23,7 +23,7 @@ import websocket
 
 
 APP_NAME = "领星数字SKU清理助手"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 LIST_URL = "https://oms.xlwms.com/platform/order/list"
 LOGIN_URL_PART = "/login"
 DEBUG_PORT = 19225
@@ -102,6 +102,8 @@ class RunReport:
     skipped_orders: int = 0
     error_orders: int = 0
     remaining_multiple: int = 0
+    stopped_early: bool = False
+    stop_reason: str = ""
     results: list[OrderResult] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -122,6 +124,7 @@ class CDPPage:
             suppress_origin=False,
         )
         self.counter = 0
+        self.events: list[dict[str, Any]] = []
 
     def close(self) -> None:
         try:
@@ -138,10 +141,17 @@ class CDPPage:
             raw = self.ws.recv()
             response = json.loads(raw)
             if response.get("id") != message_id:
+                if response.get("method") == "Page.javascriptDialogOpening":
+                    self.events.append(response)
                 continue
             if "error" in response:
                 raise CDPError(f"{method}: {response['error'].get('message', response['error'])}")
             return response.get("result", {})
+
+    def take_events(self, method: str) -> list[dict[str, Any]]:
+        matched = [event for event in self.events if event.get("method") == method]
+        self.events = [event for event in self.events if event.get("method") != method]
+        return matched
 
     def evaluate(self, expression: str, timeout: float = 30) -> Any:
         result = self.command(
@@ -513,6 +523,7 @@ class LingxingAutomation:
     def _remove_row(self, row_id: str) -> None:
         assert self.page
         before_count = len(self._read_edit_state()["rows"])
+        self.page.take_events("Page.javascriptDialogOpening")
         clicked = self.page.evaluate(
             f"""(() => {{
               const id={json.dumps(row_id)};
@@ -528,21 +539,57 @@ class LingxingAutomation:
         )
         if not clicked:
             raise RuntimeError("无法精确定位目标行的“移除”按钮。")
-        time.sleep(0.35)
-        confirmed = self.page.evaluate(
-            """(() => {
-              const dialogs=[...document.querySelectorAll('.el-message-box__wrapper,.el-dialog__wrapper')]
-                .filter(e=>e.offsetParent!==null);
-              if(!dialogs.length) return 'none';
-              const dialog=dialogs[dialogs.length-1];
-              const buttons=[...dialog.querySelectorAll('button')].filter(b=>b.offsetParent!==null);
-              const confirm=buttons.find(b=>['确定','确认'].includes((b.innerText||'').trim()));
-              if(!confirm) return false;
-              confirm.click(); return true;
-            })()"""
-        )
-        if confirmed is False:
-            raise RuntimeError("移除确认框中未找到“确定/确认”按钮，已停止保存。")
+
+        # Lingxing uses a fixed-position Element UI dialog. Fixed wrappers can have
+        # offsetParent === null even when visible, so visibility must use computed
+        # style and the rendered rectangle instead.
+        deadline = time.time() + 8
+        transition = ""
+        while time.time() < deadline:
+            native_dialogs = self.page.take_events("Page.javascriptDialogOpening")
+            if native_dialogs:
+                params = native_dialogs[-1].get("params", {})
+                if params.get("type") == "confirm" and "移除" in str(params.get("message", "")):
+                    self.page.command("Page.handleJavaScriptDialog", {"accept": True})
+                    transition = "confirmed"
+                    break
+                raise RuntimeError("出现了非平台SKU移除用途的浏览器确认框，已停止。")
+            transition = str(
+                self.page.evaluate(
+                    f"""(() => {{
+                      const before={before_count};
+                      const rowCount=[...document.querySelectorAll('table.vxe-table--body tr[rowid]')].length;
+                      if(rowCount===before-1) return 'removed';
+                      const visible=(e)=>{{
+                        const style=getComputedStyle(e);
+                        const rect=e.getBoundingClientRect();
+                        return style.display!=='none' && style.visibility!=='hidden' &&
+                          Number(style.opacity||1)>0 && rect.width>0 && rect.height>0;
+                      }};
+                      const dialogs=[...document.querySelectorAll('#ak-confirm.comfirm-dialog,.el-dialog__wrapper')]
+                        .filter(visible);
+                      if(!dialogs.length) return '';
+                      const dialog=dialogs.find(e=>(e.innerText||'').includes('移除平台SKU'));
+                      if(!dialog) return 'error:出现了非“移除平台SKU”的弹窗';
+                      const text=(dialog.innerText||'').replace(/\\s+/g,'');
+                      if(!text.includes('是否确认移除该平台SKU'))
+                        return 'error:移除弹窗提示内容不符合预期';
+                      const buttons=[...dialog.querySelectorAll('button')].filter(visible);
+                      const confirm=buttons.find(b=>(b.innerText||'').trim()==='移除');
+                      if(!confirm) return 'error:移除弹窗中没有找到“移除”确认按钮';
+                      confirm.click();
+                      return 'confirmed';
+                    }})()"""
+                )
+                or ""
+            )
+            if transition in {"removed", "confirmed"}:
+                break
+            if transition.startswith("error:"):
+                raise RuntimeError(transition.removeprefix("error:"))
+            time.sleep(0.25)
+        if transition not in {"removed", "confirmed"}:
+            raise RuntimeError("点击产品行“移除”后，8秒内未出现平台SKU确认框。")
         self._wait(lambda: len(self._read_edit_state()["rows"]) == before_count - 1, 10, "目标行移除")
 
     @staticmethod
@@ -632,6 +679,8 @@ class LingxingAutomation:
             self._save_report(report)
             return report
 
+        repeated_error = ""
+        repeated_error_count = 0
         for index, candidate in enumerate(candidates, 1):
             if self.stop_requested:
                 raise RuntimeError("用户已停止运行。")
@@ -667,8 +716,21 @@ class LingxingAutomation:
                 self.log(f"  预检命中：{', '.join(result.removed_skus)}（未修改）")
             else:
                 report.error_orders += 1
+                if result.detail == repeated_error:
+                    repeated_error_count += 1
+                else:
+                    repeated_error = result.detail
+                    repeated_error_count = 1
             self.progress(index, len(candidates))
             self._save_report(report, checkpoint=True)
+            if result.status == "error" and repeated_error_count >= 3:
+                report.stopped_early = True
+                report.stop_reason = f"连续3笔出现相同异常：{result.detail}"
+                self.log(f"安全停止：{report.stop_reason}；剩余候选未继续操作。")
+                break
+            if result.status != "error":
+                repeated_error = ""
+                repeated_error_count = 0
 
         self.log("正在刷新待处理列表并执行最终复核……")
         self.open_pending_list(refresh=True)
@@ -825,6 +887,8 @@ class App(tk.Tk):
                 f"删除 {report.removed_rows} 行，跳过 {report.skipped_orders} 笔，"
                 f"异常 {report.error_orders} 笔，复核仍显示“多个” {report.remaining_multiple} 笔。"
             )
+        if report.stopped_early:
+            summary += f" 已提前安全停止：{report.stop_reason}。"
         self.status.configure(text=summary)
         self._append_log(summary)
         if report.error_orders:
