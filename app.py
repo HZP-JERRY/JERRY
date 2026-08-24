@@ -23,7 +23,7 @@ import websocket
 
 
 APP_NAME = "领星数字SKU清理助手"
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 LIST_URL = "https://oms.xlwms.com/platform/order/list"
 LOGIN_URL_PART = "/login"
 DEBUG_PORT = 19225
@@ -420,37 +420,57 @@ class LingxingAutomation:
         result = self.page.evaluate(script)
         return result if isinstance(result, dict) else {"ready": False, "scanned": 0, "candidates": []}
 
-    def _read_stable_list_state(self, timeout: float = 30, stable_seconds: float = 2.5) -> dict[str, Any]:
-        """Wait until counts and hydrated SKU cells remain unchanged for a short window."""
+    @staticmethod
+    def _candidate_signature(state: dict[str, Any]) -> str:
+        """Compare candidates without depending on volatile list order or counts."""
+        candidates = [
+            {
+                "systemOrderId": str(item.get("systemOrderId", "")),
+                "platformOrderId": str(item.get("platformOrderId", "")),
+                "platformSkuText": str(item.get("platformSkuText", "")),
+            }
+            for item in state.get("candidates", [])
+            if isinstance(item, dict)
+        ]
+        candidates.sort(key=lambda item: (item["systemOrderId"], item["platformOrderId"]))
+        return json.dumps(candidates, ensure_ascii=False, sort_keys=True)
+
+    def _read_stable_list_state(self, timeout: float = 30) -> dict[str, Any]:
+        """Return consecutive complete candidate snapshots despite unrelated order churn."""
         deadline = time.time() + timeout
-        stable_since: float | None = None
         previous_signature: str | None = None
+        consistent_reads = 0
         last_state: dict[str, Any] = {"ready": False, "scanned": 0, "candidates": []}
         while time.time() < deadline:
             if self.stop_requested:
                 raise RuntimeError("用户已停止运行。")
             last_state = self._read_list_state()
-            signature = json.dumps(
-                {
-                    "ready": last_state.get("ready"),
-                    "scanned": last_state.get("scanned"),
-                    "total": last_state.get("total"),
-                    "tabTotal": last_state.get("tabTotal"),
-                    "allOrderIds": last_state.get("allOrderIds", []),
-                    "candidates": last_state.get("candidates", []),
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            )
-            if last_state.get("ready") and signature == previous_signature:
-                stable_since = stable_since or time.time()
-                if time.time() - stable_since >= stable_seconds:
+            if last_state.get("ready"):
+                signature = self._candidate_signature(last_state)
+                if signature == previous_signature:
+                    consistent_reads += 1
+                else:
+                    consistent_reads = 1
+                previous_signature = signature
+                # Empty results receive one extra complete read to prevent a
+                # transient loading state from being reported as zero candidates.
+                required_reads = 3 if not last_state.get("candidates") else 2
+                if consistent_reads >= required_reads:
                     return last_state
             else:
-                stable_since = None
-            previous_signature = signature
+                previous_signature = None
+                consistent_reads = 0
             time.sleep(0.5)
-        raise RuntimeError(f"订单列表在 {timeout:.0f} 秒内未达到稳定状态。")
+        details = {
+            "total": last_state.get("total"),
+            "tabTotal": last_state.get("tabTotal"),
+            "scanned": last_state.get("scanned"),
+            "pageSize": last_state.get("pageSize"),
+        }
+        raise RuntimeError(
+            f"订单列表在 {timeout:.0f} 秒内未形成完整快照："
+            f"{json.dumps(details, ensure_ascii=False, sort_keys=True)}"
+        )
 
     def _click_edit(self, system_order_id: str) -> None:
         assert self.page
