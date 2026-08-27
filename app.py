@@ -23,7 +23,7 @@ import websocket
 
 
 APP_NAME = "领星数字SKU清理助手"
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.4"
 LIST_URL = "https://oms.xlwms.com/platform/order/list"
 LOGIN_URL_PART = "/login"
 DEBUG_PORT = 19225
@@ -66,6 +66,62 @@ def choose_removal_targets(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if len(matches) > allowed:
         matches = matches[-allowed:] if allowed else []
     return list(reversed(matches))
+
+
+def assemble_list_state(
+    start: dict[str, Any],
+    end: dict[str, Any],
+    chunks: list[list[dict[str, Any]]],
+) -> dict[str, Any]:
+    """Merge overlapping virtual-table viewports into one verified list snapshot."""
+    seen_order: list[str] = []
+    seen_ids: set[str] = set()
+    hydrated: dict[str, dict[str, str]] = {}
+    max_rendered = 0
+    for chunk in chunks:
+        max_rendered = max(max_rendered, len(chunk))
+        for row in chunk:
+            system_id = str(row.get("systemOrderId", "")).strip()
+            if not system_id:
+                continue
+            if system_id not in seen_ids:
+                seen_ids.add(system_id)
+                seen_order.append(system_id)
+            platform_id = str(row.get("platformOrderId", "")).strip()
+            sku_text = str(row.get("platformSkuText", "")).strip()
+            if platform_id and sku_text:
+                hydrated[system_id] = {
+                    "systemOrderId": system_id,
+                    "platformOrderId": platform_id,
+                    "platformSkuText": sku_text,
+                }
+
+    count_keys = ("total", "tabTotal", "pageSize")
+    counts_stable = all(start.get(key) == end.get(key) for key in count_keys)
+    total = int(end.get("total") or 0)
+    page_size = int(end.get("pageSize") or 0)
+    expected = min(total, page_size) if page_size else 0
+    candidates = [
+        hydrated[system_id]
+        for system_id in seen_order
+        if system_id in hydrated and "多个" in hydrated[system_id]["platformSkuText"]
+    ]
+    return {
+        "ready": (
+            counts_stable
+            and end.get("tabTotal") == total
+            and len(seen_ids) == expected
+            and len(hydrated) == expected
+        ),
+        "scanned": len(seen_ids),
+        "total": total,
+        "tabTotal": end.get("tabTotal"),
+        "pageSize": page_size,
+        "allOrderIds": seen_order,
+        "candidates": candidates,
+        "virtualized": expected > max_rendered,
+        "maxRenderedRows": max_rendered,
+    }
 
 
 def acquire_single_instance() -> bool:
@@ -322,7 +378,21 @@ class LingxingAutomation:
             "待处理订单数据",
         )
         self._set_page_size_for_all()
-        self._wait(lambda: bool(self._read_list_state().get("ready")), 25, "订单表格")
+        self._wait(
+            lambda: bool(
+                self.page.evaluate(
+                    """(() => {
+                      const total=Number(((document.querySelector('.el-pagination__total')?.innerText||'')
+                        .match(/\\d+/)||['0'])[0]);
+                      const rows=document.querySelectorAll(
+                        '.vxe-table--body-wrapper.body--wrapper tr[rowid]').length;
+                      return total===0 || rows>0;
+                    })()"""
+                )
+            ),
+            25,
+            "订单表格首屏",
+        )
 
     def _pagination_state(self) -> dict[str, int]:
         assert self.page
@@ -376,9 +446,21 @@ class LingxingAutomation:
         self._wait(lambda: self._pagination_state()["pageSize"] == target_size, 10, "分页数量更新")
         time.sleep(0.5)
 
+    @staticmethod
+    def _virtual_scroll_positions(scroll_height: int, client_height: int) -> list[int]:
+        max_scroll = max(0, scroll_height - client_height)
+        if max_scroll == 0:
+            return [0]
+        step = max(120, int(client_height * 0.7))
+        positions = list(range(0, max_scroll, step))
+        if not positions or positions[-1] != max_scroll:
+            positions.append(max_scroll)
+        return positions
+
     def _read_list_state(self) -> dict[str, Any]:
+        """Read every row of a VXE table, including rows outside the rendered viewport."""
         assert self.page
-        script = """(() => {
+        metadata_script = """(() => {
           const headers=[...document.querySelectorAll('table.vxe-table--header th')]
             .map(th=>({text:(th.innerText||'').replace(/\\s+/g,'').trim(), colid:th.getAttribute('colid')}));
           const col=(name)=>headers.find(h=>h.text===name)?.colid;
@@ -391,34 +473,76 @@ class LingxingAutomation:
             .find(e=>/^待处理(?:\\s|\\()/.test((e.innerText||'').trim()));
           const tabMatch=(pendingTab?.innerText||'').match(/\\((\\d+)\\)/);
           const tabTotal=tabMatch ? Number(tabMatch[1]) : null;
-          if(!platformCol||!skuCol||!pageSize||tabTotal===null)
-            return {ready:false, scanned:0, total, tabTotal, pageSize, candidates:[]};
-          const rows=[...document.querySelectorAll('table.vxe-table--body tr[rowid]')];
-          const rowIds=[...new Set(rows.map(r=>r.getAttribute('rowid')).filter(Boolean))];
-          const candidates=[];
-          let hydrated=true;
-          for(const rowid of rowIds){
-            const main=rows.find(r=>r.getAttribute('rowid')===rowid && r.querySelector(`td[colid="${skuCol}"]`));
-            if(!main){ hydrated=false; continue; }
-            const skuText=(main.querySelector(`td[colid="${skuCol}"]`)?.innerText||'').trim();
-            const platformId=(main.querySelector(`td[colid="${platformCol}"]`)?.innerText||'').trim().split(/\\s+/)[0];
-            if(!skuText || !platformId){ hydrated=false; continue; }
-            if(!skuText.includes('多个')) continue;
-            candidates.push({systemOrderId:rowid, platformOrderId:platformId, platformSkuText:skuText});
-          }
-          const expected=Math.min(total,pageSize);
+          const wrapper=document.querySelector('.vxe-table--body-wrapper.body--wrapper');
           return {
-            ready:total===tabTotal && rowIds.length===expected && hydrated,
-            scanned:rowIds.length,
-            total,
-            tabTotal,
-            pageSize,
-            allOrderIds:rowIds,
-            candidates
+            valid:!!platformCol&&!!skuCol&&!!pageSize&&tabTotal!==null&&!!wrapper,
+            platformCol,skuCol,total,tabTotal,pageSize,
+            clientHeight:wrapper?.clientHeight||0,
+            scrollHeight:wrapper?.scrollHeight||0,
+            originalScrollTop:wrapper?.scrollTop||0
           };
         })()"""
-        result = self.page.evaluate(script)
-        return result if isinstance(result, dict) else {"ready": False, "scanned": 0, "candidates": []}
+        start = self.page.evaluate(metadata_script)
+        if not isinstance(start, dict) or not start.get("valid"):
+            return {"ready": False, "scanned": 0, "candidates": []}
+
+        positions = self._virtual_scroll_positions(
+            int(start.get("scrollHeight") or 0),
+            int(start.get("clientHeight") or 0),
+        )
+        platform_col = json.dumps(str(start["platformCol"]))
+        sku_col = json.dumps(str(start["skuCol"]))
+        original_scroll = int(start.get("originalScrollTop") or 0)
+        chunks: list[list[dict[str, Any]]] = []
+        try:
+            for position in positions:
+                if self.stop_requested:
+                    raise RuntimeError("用户已停止运行。")
+                self.page.evaluate(
+                    f"""(() => {{
+                      const wrapper=document.querySelector('.vxe-table--body-wrapper.body--wrapper');
+                      if(!wrapper) return false;
+                      wrapper.scrollTop={position};
+                      wrapper.dispatchEvent(new Event('scroll',{{bubbles:true}}));
+                      return true;
+                    }})()"""
+                )
+                time.sleep(0.1)
+                chunk = self.page.evaluate(
+                    f"""(() => {{
+                      const platformCol={platform_col}, skuCol={sku_col};
+                      const wrapper=document.querySelector('.vxe-table--body-wrapper.body--wrapper');
+                      if(!wrapper) return [];
+                      return [...wrapper.querySelectorAll('tr[rowid]')].map(row=>{{
+                        const systemOrderId=row.getAttribute('rowid')||'';
+                        const platformSkuText=(row.querySelector(
+                          'td[colid="'+skuCol+'"]')?.innerText||'').trim();
+                        const platformOrderText=(row.querySelector(
+                          'td[colid="'+platformCol+'"]')?.innerText||'').trim();
+                        const platformOrderId=platformOrderText.split(/\\s+/)[0]||'';
+                        return {{systemOrderId,platformOrderId,platformSkuText}};
+                      }});
+                    }})()"""
+                )
+                chunks.append(chunk if isinstance(chunk, list) else [])
+        finally:
+            try:
+                self.page.evaluate(
+                    f"""(() => {{
+                      const wrapper=document.querySelector('.vxe-table--body-wrapper.body--wrapper');
+                      if(!wrapper) return false;
+                      wrapper.scrollTop={original_scroll};
+                      wrapper.dispatchEvent(new Event('scroll',{{bubbles:true}}));
+                      return true;
+                    }})()"""
+                )
+            except Exception:
+                pass
+
+        end = self.page.evaluate(metadata_script)
+        if not isinstance(end, dict):
+            return {"ready": False, "scanned": 0, "candidates": []}
+        return assemble_list_state(start, end, chunks)
 
     @staticmethod
     def _candidate_signature(state: dict[str, Any]) -> str:
@@ -466,6 +590,8 @@ class LingxingAutomation:
             "tabTotal": last_state.get("tabTotal"),
             "scanned": last_state.get("scanned"),
             "pageSize": last_state.get("pageSize"),
+            "maxRenderedRows": last_state.get("maxRenderedRows"),
+            "virtualized": last_state.get("virtualized"),
         }
         raise RuntimeError(
             f"订单列表在 {timeout:.0f} 秒内未形成完整快照："
@@ -473,25 +599,72 @@ class LingxingAutomation:
         )
 
     def _click_edit(self, system_order_id: str) -> None:
+        """Find an order across virtual rows, then click only its Edit button."""
         assert self.page
-        def click_when_ready() -> bool:
-            return bool(
+        metrics = self.page.evaluate(
+            """(() => {
+              const wrapper=document.querySelector('.vxe-table--body-wrapper.body--wrapper');
+              return wrapper ? {
+                clientHeight:wrapper.clientHeight,scrollHeight:wrapper.scrollHeight,
+                originalScrollTop:wrapper.scrollTop
+              } : null;
+            })()"""
+        )
+        if not isinstance(metrics, dict):
+            raise RuntimeError("未找到订单表格，无法定位编辑按钮。")
+        positions = self._virtual_scroll_positions(
+            int(metrics.get("scrollHeight") or 0),
+            int(metrics.get("clientHeight") or 0),
+        )
+        original_scroll = int(metrics.get("originalScrollTop") or 0)
+        safe_id = json.dumps(system_order_id)
+        clicked = False
+        try:
+            for position in positions:
+                if self.stop_requested:
+                    raise RuntimeError("用户已停止运行。")
                 self.page.evaluate(
                     f"""(() => {{
-                      const safe={json.dumps(system_order_id)};
-                      const rows=[...document.querySelectorAll('table.vxe-table--body tr[rowid]')]
-                        .filter(r=>r.getAttribute('rowid')===safe);
-                      const row=rows.find(r=>[...r.querySelectorAll('button')]
-                        .some(b=>(b.innerText||'').trim()==='编辑'));
-                      const button=row && [...row.querySelectorAll('button')]
-                        .find(b=>(b.innerText||'').trim()==='编辑');
-                      if(!button) return false;
-                      button.click(); return true;
+                      const wrapper=document.querySelector('.vxe-table--body-wrapper.body--wrapper');
+                      if(!wrapper) return false;
+                      wrapper.scrollTop={position};
+                      wrapper.dispatchEvent(new Event('scroll',{{bubbles:true}}));
+                      return true;
                     }})()"""
                 )
-            )
-
-        self._wait(click_when_ready, 10, "该订单的编辑按钮")
+                time.sleep(0.1)
+                clicked = bool(
+                    self.page.evaluate(
+                        f"""(() => {{
+                          const safe={safe_id};
+                          const rows=[...document.querySelectorAll('table.vxe-table--body tr[rowid]')]
+                            .filter(row=>row.getAttribute('rowid')===safe);
+                          const button=rows.flatMap(row=>[...row.querySelectorAll('button')])
+                            .find(item=>(item.innerText||'').trim()==='编辑');
+                          if(!button) return false;
+                          button.click();
+                          return true;
+                        }})()"""
+                    )
+                )
+                if clicked:
+                    break
+        finally:
+            if not clicked:
+                try:
+                    self.page.evaluate(
+                        f"""(() => {{
+                          const wrapper=document.querySelector('.vxe-table--body-wrapper.body--wrapper');
+                          if(!wrapper) return false;
+                          wrapper.scrollTop={original_scroll};
+                          wrapper.dispatchEvent(new Event('scroll',{{bubbles:true}}));
+                          return true;
+                        }})()"""
+                    )
+                except Exception:
+                    pass
+        if not clicked:
+            raise RuntimeError("候选订单已不在当前待处理列表，未执行任何修改。")
         self._wait(lambda: f"/platform/order/edit/{system_order_id}" in self.page.url(), 20, "订单编辑页")
         self._wait(lambda: "产品信息" in self.page.body_text(), 20, "产品信息")
         self._wait(

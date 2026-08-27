@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from app import (
     LingxingAutomation,
+    assemble_list_state,
     choose_removal_targets,
     is_numeric_platform_sku,
     normalize_blank,
@@ -101,6 +102,46 @@ class ListSnapshotTests(unittest.TestCase):
         ]
         result = self.automation_with_states(states)._read_stable_list_state(timeout=0.1)
         self.assertTrue(result["ready"])
+
+    def test_virtual_scroll_positions_cover_top_and_bottom(self):
+        self.assertEqual(LingxingAutomation._virtual_scroll_positions(400, 400), [0])
+        positions = LingxingAutomation._virtual_scroll_positions(4620, 448)
+        self.assertEqual(positions[0], 0)
+        self.assertEqual(positions[-1], 4172)
+        self.assertGreater(len(positions), 2)
+
+    def test_overlapping_virtual_chunks_form_complete_snapshot(self):
+        counts = {"total": 5, "tabTotal": 5, "pageSize": 200}
+        chunks = [
+            [
+                {"systemOrderId": "SO1", "platformOrderId": "P1", "platformSkuText": "单个"},
+                {"systemOrderId": "SO2", "platformOrderId": "P2", "platformSkuText": "多个(2)"},
+                {"systemOrderId": "SO3", "platformOrderId": "P3", "platformSkuText": "单个"},
+            ],
+            [
+                {"systemOrderId": "SO3", "platformOrderId": "P3", "platformSkuText": "单个"},
+                {"systemOrderId": "SO4", "platformOrderId": "P4", "platformSkuText": "多个(2)"},
+                {"systemOrderId": "SO5", "platformOrderId": "P5", "platformSkuText": "单个"},
+            ],
+        ]
+        state = assemble_list_state(counts, counts, chunks)
+        self.assertTrue(state["ready"])
+        self.assertTrue(state["virtualized"])
+        self.assertEqual(state["scanned"], 5)
+        self.assertEqual(
+            [item["systemOrderId"] for item in state["candidates"]],
+            ["SO2", "SO4"],
+        )
+
+    def test_virtual_snapshot_rejects_count_change_or_unhydrated_row(self):
+        start = {"total": 2, "tabTotal": 2, "pageSize": 200}
+        changed = {"total": 3, "tabTotal": 3, "pageSize": 200}
+        chunks = [[
+            {"systemOrderId": "SO1", "platformOrderId": "P1", "platformSkuText": "单个"},
+            {"systemOrderId": "SO2", "platformOrderId": "", "platformSkuText": "多个(2)"},
+        ]]
+        self.assertFalse(assemble_list_state(start, changed, chunks)["ready"])
+        self.assertFalse(assemble_list_state(start, start, chunks)["ready"])
 
 
 if __name__ == "__main__":
