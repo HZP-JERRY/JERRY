@@ -164,8 +164,11 @@ class ListSnapshotTests(unittest.TestCase):
 
     def test_present_candidate_without_edit_button_remains_an_error(self):
         automation = LingxingAutomation(lambda _: None, lambda _x, _y: None)
+        attempts = 0
 
         def missing(_system_id):
+            nonlocal attempts
+            attempts += 1
             raise OrderRowNotFound("missing")
 
         automation._click_edit = missing  # type: ignore[method-assign]
@@ -173,11 +176,38 @@ class ListSnapshotTests(unittest.TestCase):
         automation._read_stable_list_state = (  # type: ignore[method-assign]
             lambda timeout=30: {"allOrderIds": ["SO1"]}
         )
-        with self.assertRaisesRegex(RuntimeError, "仍在待处理列表"):
+        with self.assertRaisesRegex(RuntimeError, "刷新后仍无法定位唯一编辑按钮"):
             automation.process_order(
                 {"systemOrderId": "SO1", "platformOrderId": "P1"},
                 scan_only=False,
             )
+        self.assertEqual(attempts, 2)
+
+    def test_present_candidate_retries_after_fresh_list_mount(self):
+        automation = LingxingAutomation(lambda _: None, lambda _x, _y: None)
+        attempts = 0
+
+        def succeeds_second_time(_system_id):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OrderRowNotFound("fixed-right row not hydrated")
+
+        automation._click_edit = succeeds_second_time  # type: ignore[method-assign]
+        automation.open_pending_list = lambda refresh=False: None  # type: ignore[method-assign]
+        automation._read_stable_list_state = (  # type: ignore[method-assign]
+            lambda timeout=30: {"allOrderIds": ["SO1"]}
+        )
+        automation._read_edit_state = lambda: {  # type: ignore[method-assign]
+            "rows": [row("SKU", sku="SKU", name="P", inventory="9")],
+            "outsideInputs": [],
+        }
+        result = automation.process_order(
+            {"systemOrderId": "SO1", "platformOrderId": "P1"},
+            scan_only=True,
+        )
+        self.assertEqual(attempts, 2)
+        self.assertEqual(result.status, "skipped")
 
 
 if __name__ == "__main__":

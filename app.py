@@ -23,7 +23,7 @@ import websocket
 
 
 APP_NAME = "领星数字SKU清理助手"
-APP_VERSION = "1.1.5"
+APP_VERSION = "1.1.6"
 LIST_URL = "https://oms.xlwms.com/platform/order/list"
 LOGIN_URL_PART = "/login"
 DEBUG_PORT = 19225
@@ -638,21 +638,40 @@ class LingxingAutomation:
                       return true;
                     }})()"""
                 )
-                time.sleep(0.1)
-                clicked = bool(
-                    self.page.evaluate(
+                # VXE renders the operation column in a separate fixed-right
+                # table. Its row can lag behind the main virtual body briefly
+                # after scrolling, so wait for both halves to hydrate.
+                time.sleep(0.15)
+                row_seen = False
+                for render_attempt in range(8):
+                    edit_state = self.page.evaluate(
                         f"""(() => {{
                           const safe={safe_id};
+                          const visible=(e)=>{{
+                            const style=getComputedStyle(e), rect=e.getBoundingClientRect();
+                            return style.display!=='none' && style.visibility!=='hidden' &&
+                              Number(style.opacity||1)>0 && rect.width>0 && rect.height>0;
+                          }};
                           const rows=[...document.querySelectorAll('table.vxe-table--body tr[rowid]')]
                             .filter(row=>row.getAttribute('rowid')===safe);
-                          const button=rows.flatMap(row=>[...row.querySelectorAll('button')])
-                            .find(item=>(item.innerText||'').trim()==='编辑');
-                          if(!button) return false;
-                          button.click();
-                          return true;
+                          const controls=rows.flatMap(row=>
+                            [...row.querySelectorAll('button,a,[role=button]')])
+                            .filter(item=>visible(item) &&
+                              (item.innerText||item.textContent||'').replace(/\\s+/g,'').trim()==='编辑' &&
+                              !item.disabled);
+                          if(controls.length!==1)
+                            return {{rowSeen:rows.length>0,clicked:false,editCount:controls.length}};
+                          controls[0].click();
+                          return {{rowSeen:true,clicked:true,editCount:1}};
                         }})()"""
-                    )
-                )
+                    ) or {}
+                    row_seen = row_seen or bool(edit_state.get("rowSeen"))
+                    clicked = bool(edit_state.get("clicked"))
+                    if clicked:
+                        break
+                    if not row_seen and render_attempt >= 1:
+                        break
+                    time.sleep(0.15)
                 if clicked:
                     break
         finally:
@@ -938,9 +957,16 @@ class LingxingAutomation:
                     "skipped",
                     detail="候选订单已离开待处理列表，未执行任何修改",
                 )
-            raise RuntimeError(
-                "候选订单仍在待处理列表，但无法定位编辑按钮，已安全停止该订单。"
-            ) from exc
+            # The first attempt proved that no Edit control was clicked. A
+            # fresh list mount is safe and fixes the VXE race where the main
+            # row updates before its fixed-right operation row.
+            self.log("  候选订单仍在待处理，刷新列表后重试定位一次。")
+            try:
+                self._click_edit(system_id)
+            except OrderRowNotFound as retry_exc:
+                raise RuntimeError(
+                    "候选订单仍在待处理列表，但刷新后仍无法定位唯一编辑按钮，已安全停止该订单。"
+                ) from retry_exc
         if not scan_only:
             self._wait_edit_form_stable()
         initial = self._read_edit_state()
