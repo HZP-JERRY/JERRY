@@ -23,7 +23,7 @@ import websocket
 
 
 APP_NAME = "领星数字SKU清理助手"
-APP_VERSION = "1.1.4"
+APP_VERSION = "1.1.5"
 LIST_URL = "https://oms.xlwms.com/platform/order/list"
 LOGIN_URL_PART = "/login"
 DEBUG_PORT = 19225
@@ -168,6 +168,12 @@ class RunReport:
 
 
 class CDPError(RuntimeError):
+    pass
+
+
+class OrderRowNotFound(RuntimeError):
+    """The requested order row was not rendered anywhere in the current list."""
+
     pass
 
 
@@ -664,7 +670,7 @@ class LingxingAutomation:
                 except Exception:
                     pass
         if not clicked:
-            raise RuntimeError("候选订单已不在当前待处理列表，未执行任何修改。")
+            raise OrderRowNotFound("未找到候选订单的编辑按钮。")
         self._wait(lambda: f"/platform/order/edit/{system_order_id}" in self.page.url(), 20, "订单编辑页")
         self._wait(lambda: "产品信息" in self.page.body_text(), 20, "产品信息")
         self._wait(
@@ -918,7 +924,23 @@ class LingxingAutomation:
     def process_order(self, candidate: dict[str, Any], scan_only: bool) -> OrderResult:
         system_id = candidate["systemOrderId"]
         platform_id = candidate.get("platformOrderId", "")
-        self._click_edit(system_id)
+        try:
+            self._click_edit(system_id)
+        except OrderRowNotFound as exc:
+            # This check is strictly before any row removal or Save. A candidate
+            # may legitimately leave 待处理 while an earlier order is processed.
+            self.open_pending_list(refresh=True)
+            latest = self._read_stable_list_state()
+            if system_id not in set(latest.get("allOrderIds", [])):
+                return OrderResult(
+                    system_id,
+                    platform_id,
+                    "skipped",
+                    detail="候选订单已离开待处理列表，未执行任何修改",
+                )
+            raise RuntimeError(
+                "候选订单仍在待处理列表，但无法定位编辑按钮，已安全停止该订单。"
+            ) from exc
         if not scan_only:
             self._wait_edit_form_stable()
         initial = self._read_edit_state()

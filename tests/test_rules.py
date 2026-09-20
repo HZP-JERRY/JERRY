@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from app import (
     LingxingAutomation,
+    OrderRowNotFound,
     assemble_list_state,
     choose_removal_targets,
     is_numeric_platform_sku,
@@ -142,6 +143,41 @@ class ListSnapshotTests(unittest.TestCase):
         ]]
         self.assertFalse(assemble_list_state(start, changed, chunks)["ready"])
         self.assertFalse(assemble_list_state(start, start, chunks)["ready"])
+
+    def test_candidate_that_left_pending_is_skipped_before_modification(self):
+        automation = LingxingAutomation(lambda _: None, lambda _x, _y: None)
+
+        def missing(_system_id):
+            raise OrderRowNotFound("missing")
+
+        automation._click_edit = missing  # type: ignore[method-assign]
+        automation.open_pending_list = lambda refresh=False: None  # type: ignore[method-assign]
+        automation._read_stable_list_state = (  # type: ignore[method-assign]
+            lambda timeout=30: {"allOrderIds": []}
+        )
+        result = automation.process_order(
+            {"systemOrderId": "SO1", "platformOrderId": "P1"},
+            scan_only=False,
+        )
+        self.assertEqual(result.status, "skipped")
+        self.assertIn("未执行任何修改", result.detail)
+
+    def test_present_candidate_without_edit_button_remains_an_error(self):
+        automation = LingxingAutomation(lambda _: None, lambda _x, _y: None)
+
+        def missing(_system_id):
+            raise OrderRowNotFound("missing")
+
+        automation._click_edit = missing  # type: ignore[method-assign]
+        automation.open_pending_list = lambda refresh=False: None  # type: ignore[method-assign]
+        automation._read_stable_list_state = (  # type: ignore[method-assign]
+            lambda timeout=30: {"allOrderIds": ["SO1"]}
+        )
+        with self.assertRaisesRegex(RuntimeError, "仍在待处理列表"):
+            automation.process_order(
+                {"systemOrderId": "SO1", "platformOrderId": "P1"},
+                scan_only=False,
+            )
 
 
 if __name__ == "__main__":
